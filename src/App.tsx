@@ -25,12 +25,13 @@ type Settings = {
   reminderMessage: string;
   dailyGoal: number;
   testLength: number;
+  theme: "light" | "dark";
 };
 
 const LS_KEYS = {
-  BANK: "itf_bank_v1",
-  HISTORY: "itf_history_v1",
-  SETTINGS: "itf_settings_v1",
+  BANK: "itf_bank_v2",
+  HISTORY: "itf_history_v2",
+  SETTINGS: "itf_settings_v2",
 } as const;
 
 const DEFAULT_SETTINGS: Settings = {
@@ -40,6 +41,7 @@ const DEFAULT_SETTINGS: Settings = {
   reminderMessage: "It’s time for your Taekwon-Do theory mock test.",
   dailyGoal: 10,
   testLength: 10,
+  theme: "light",
 };
 
 function uid(): string {
@@ -86,7 +88,16 @@ function nextReminderDelayMs(settings: Settings) {
   return 24 * 60 * 60 * 1000;
 }
 
-// Seeded from your sheets; you can add more via Edit/paste JSON in the app.
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// Seeded from your sheets; add more via Edit/paste JSON in the app.
 const BUILTIN_QUESTION_BANK: Question[] = [
   {
     id: "q_tenets",
@@ -114,8 +125,7 @@ const BUILTIN_QUESTION_BANK: Question[] = [
   {
     id: "q_itf_founded",
     prompt: "Who founded the ITF and when?",
-    modelAnswer:
-      "The International Taekwon-Do Federation (ITF) was founded in 1966 by General Choi Hong Hi.",
+    modelAnswer: "The ITF was founded in 1966 by General Choi Hong Hi.",
     tags: ["history"],
     sourceNote: "OMA theory sheet",
   },
@@ -169,22 +179,27 @@ function computeStats(history: HistoryEntry[]) {
   const total = history.length;
   const correct = history.filter((h) => h.correct).length;
   const incorrect = total - correct;
-  const byId: Record<string, { attempts: number; correct: number; incorrect: number }> = {};
+
+  const byQuestion: Record<string, { attempts: number; correct: number; incorrect: number }> = {};
+  const byTag: Record<string, { attempts: number; correct: number; incorrect: number }> = {};
 
   for (const h of history) {
-    byId[h.qid] ??= { attempts: 0, correct: 0, incorrect: 0 };
-    byId[h.qid].attempts += 1;
-    if (h.correct) byId[h.qid].correct += 1;
-    else byId[h.qid].incorrect += 1;
+    byQuestion[h.qid] ??= { attempts: 0, correct: 0, incorrect: 0 };
+    byQuestion[h.qid].attempts += 1;
+    if (h.correct) byQuestion[h.qid].correct += 1;
+    else byQuestion[h.qid].incorrect += 1;
+
+    for (const t of h.tags || []) {
+      byTag[t] ??= { attempts: 0, correct: 0, incorrect: 0 };
+      byTag[t].attempts += 1;
+      if (h.correct) byTag[t].correct += 1;
+      else byTag[t].incorrect += 1;
+    }
   }
 
-  return {
-    total,
-    correct,
-    incorrect,
-    accuracy: total ? Math.round((correct / total) * 100) : 0,
-    byId,
-  };
+  const accuracy = total ? Math.round((correct / total) * 100) : 0;
+
+  return { total, correct, incorrect, accuracy, byQuestion, byTag };
 }
 
 function pickQuestion(pool: Question[]) {
@@ -209,6 +224,19 @@ export default function App() {
 
   const reminderTimerRef = useRef<number | null>(null);
 
+  // Exam mode state
+  const [mode, setMode] = useState<"practice" | "exam" | "examResult">("practice");
+  const [examOrder, setExamOrder] = useState<Question[]>([]);
+  const [examIndex, setExamIndex] = useState(0);
+  const [examAnswers, setExamAnswers] = useState<{ qid: string; correct: boolean }[]>([]);
+
+  // Theme
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", settings.theme);
+    saveJSON(LS_KEYS.SETTINGS, settings);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.theme]);
+
   const allTags = useMemo(() => {
     const s = new Set<string>();
     for (const q of bank) (q.tags || []).forEach((t) => s.add(t));
@@ -220,25 +248,29 @@ export default function App() {
     return bank.filter((q) => (q.tags || []).some((t) => filters.tags.has(t)));
   }, [bank, filters.tags]);
 
-  function newQuestion() {
+  function newPracticeQuestion() {
     const q = pickQuestion(pool);
     setCurrent(q);
     setShowAnswer(false);
   }
 
-  function scoreCurrent(correct: boolean) {
-    if (!current) return;
+  function logAttempt(q: Question, correct: boolean) {
     const entry: HistoryEntry = {
       id: uid(),
-      qid: current.id,
+      qid: q.id,
       correct,
       at: new Date().toISOString(),
-      tags: current.tags || [],
+      tags: q.tags || [],
     };
     const nextHistory = [entry, ...history].slice(0, 5000);
     setHistory(nextHistory);
     saveJSON(LS_KEYS.HISTORY, nextHistory);
-    newQuestion();
+  }
+
+  function scorePractice(correct: boolean) {
+    if (!current) return;
+    logAttempt(current, correct);
+    newPracticeQuestion();
   }
 
   async function requestNotifications() {
@@ -269,7 +301,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!current) newQuestion();
+    if (!current) newPracticeQuestion();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -331,13 +363,88 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
+  // Weak areas
+  const weakestTags = useMemo(() => {
+    const rows = Object.entries(stats.byTag).map(([tag, v]) => ({
+      tag,
+      attempts: v.attempts,
+      acc: v.attempts ? Math.round((v.correct / v.attempts) * 100) : 0,
+    }));
+    // prioritize: enough attempts + low accuracy
+    rows.sort((a, b) => (a.acc - b.acc) || (b.attempts - a.attempts));
+    return rows.filter(r => r.attempts >= 3).slice(0, 5);
+  }, [stats.byTag]);
+
+  const weakestQuestions = useMemo(() => {
+    const byId = stats.byQuestion;
+    const rows = Object.entries(byId).map(([qid, v]) => ({
+      qid,
+      attempts: v.attempts,
+      acc: v.attempts ? Math.round((v.correct / v.attempts) * 100) : 0,
+    }));
+    rows.sort((a, b) => (a.acc - b.acc) || (b.attempts - a.attempts));
+    const idToPrompt = new Map(bank.map(q => [q.id, q.prompt]));
+    return rows
+      .filter(r => r.attempts >= 2)
+      .slice(0, 5)
+      .map(r => ({ ...r, prompt: idToPrompt.get(r.qid) || r.qid }));
+  }, [stats.byQuestion, bank]);
+
+  // Exam mode
+  function startExam() {
+    const len = clamp(settings.testLength || 10, 5, 50);
+    const chosen = shuffle(pool).slice(0, Math.min(len, pool.length));
+    setExamOrder(chosen);
+    setExamIndex(0);
+    setExamAnswers([]);
+    setShowAnswer(false);
+    setMode("exam");
+  }
+
+  function currentExamQ() {
+    return examOrder[examIndex] || null;
+  }
+
+  function answerExam(correct: boolean) {
+    const q = currentExamQ();
+    if (!q) return;
+
+    logAttempt(q, correct);
+    setExamAnswers((prev) => [...prev, { qid: q.id, correct }]);
+
+    const nextIndex = examIndex + 1;
+    if (nextIndex >= examOrder.length) {
+      setMode("examResult");
+      return;
+    }
+    setExamIndex(nextIndex);
+    setShowAnswer(false);
+  }
+
+  const examScore = useMemo(() => {
+    if (!examAnswers.length) return { correct: 0, total: examOrder.length, pct: 0 };
+    const c = examAnswers.filter(a => a.correct).length;
+    const t = examOrder.length;
+    return { correct: c, total: t, pct: t ? Math.round((c / t) * 100) : 0 };
+  }, [examAnswers, examOrder.length]);
+
+  const missedInExam = useMemo(() => {
+    const missedIds = new Set(examAnswers.filter(a => !a.correct).map(a => a.qid));
+    return examOrder.filter(q => missedIds.has(q.id));
+  }, [examAnswers, examOrder]);
+
   return (
     <div className="wrap">
       <header className="header">
-        <div className="title">
+        <div className="titleBlock">
           <div className="h1">ITF Taekwon-Do Theory Mock Test</div>
-          <div className="sub">Self-assess (Correct/Incorrect), track accuracy, and use reminders.</div>
+          <div className="sub">Practice honestly. Then use Exam Mode to pressure-test recall.</div>
+          <div className="dojoMark">
+            <span className="badge">1st → 2nd Dan prep</span>
+            <span className="badge">ITF • patterns • theory • terminology</span>
+          </div>
         </div>
+
         <div className="topStats">
           <div className="pill">
             <div className="pillLabel">Accuracy</div>
@@ -357,56 +464,143 @@ export default function App() {
       </header>
 
       <main className="main">
-        <section className="card left">
+        <section className="card">
           <div className="cardHeader">
-            <div className="cardTitle">Mock test</div>
+            <div className="cardTitle">
+              {mode === "practice" && "Practice"}
+              {mode === "exam" && `Exam Mode • Q${examIndex + 1}/${examOrder.length}`}
+              {mode === "examResult" && "Exam Results"}
+            </div>
+
             <div className="cardActions">
-              <button className="btn" onClick={newQuestion}>
-                New question
+              <button className="btn ghost" onClick={() => setSettings({ ...settings, theme: settings.theme === "dark" ? "light" : "dark" })}>
+                {settings.theme === "dark" ? "Light mode" : "Dark mode"}
               </button>
-              <button className="btn" onClick={() => setShowAnswer((v) => !v)}>
-                {showAnswer ? "Hide model answer" : "Reveal model answer"}
-              </button>
+
+              {mode !== "exam" && (
+                <button className="btn primary" onClick={startExam}>
+                  Start exam ({settings.testLength})
+                </button>
+              )}
+
+              {mode === "practice" && (
+                <>
+                  <button className="btn" onClick={newPracticeQuestion}>New question</button>
+                  <button className="btn" onClick={() => setShowAnswer((v) => !v)}>
+                    {showAnswer ? "Hide model answer" : "Reveal model answer"}
+                  </button>
+                </>
+              )}
+
+              {mode === "examResult" && (
+                <button className="btn" onClick={() => setMode("practice")}>
+                  Back to practice
+                </button>
+              )}
             </div>
           </div>
 
-          {!current ? (
-            <div className="empty">Tap “New question” to begin.</div>
-          ) : (
+          {mode === "practice" && (
             <>
-              <div className="qPrompt">{current.prompt}</div>
+              {!current ? (
+                <div className="hint">Tap “New question” to begin.</div>
+              ) : (
+                <>
+                  <div className="qPrompt">{current.prompt}</div>
 
-              <div className="controlsRow">
-                <button className="btn success" onClick={() => scoreCurrent(true)}>
-                  ✓ Correct
-                </button>
-                <button className="btn danger" onClick={() => scoreCurrent(false)}>
-                  ✗ Incorrect
-                </button>
-              </div>
+                  <div className="controlsRow">
+                    <button className="btn success" onClick={() => scorePractice(true)}>✓ Correct</button>
+                    <button className="btn danger" onClick={() => scorePractice(false)}>✗ Incorrect</button>
+                  </div>
 
-              {showAnswer && (
-                <div className="answerBox">
-                  <div className="answerTitle">Model answer</div>
-                  <div className="answerText">{current.modelAnswer}</div>
-                  {current.sourceNote && <div className="answerMeta">Source: {current.sourceNote}</div>}
-                </div>
+                  {showAnswer && (
+                    <div className="answerBox">
+                      <div className="answerTitle">Model answer</div>
+                      <div className="answerText">{current.modelAnswer}</div>
+                      {current.sourceNote && <div className="answerMeta">Source: {current.sourceNote}</div>}
+                    </div>
+                  )}
+
+                  <div className="tagRow">
+                    {(current.tags || []).map((t) => (
+                      <span key={t} className="tag">{t}</span>
+                    ))}
+                  </div>
+                </>
               )}
+            </>
+          )}
 
-              <div className="metaRow">
-                <div className="tagRow">
-                  {(current.tags || []).map((t) => (
-                    <span key={t} className="tag">
-                      {t}
-                    </span>
-                  ))}
+          {mode === "exam" && (
+            <>
+              {currentExamQ() ? (
+                <>
+                  <div className="qPrompt">{currentExamQ()!.prompt}</div>
+
+                  <div className="controlsRow">
+                    <button className="btn" onClick={() => setShowAnswer((v) => !v)}>
+                      {showAnswer ? "Hide model answer" : "Reveal model answer"}
+                    </button>
+                    <button className="btn success" onClick={() => answerExam(true)}>✓ I got it right</button>
+                    <button className="btn danger" onClick={() => answerExam(false)}>✗ I missed it</button>
+                  </div>
+
+                  {showAnswer && (
+                    <div className="answerBox">
+                      <div className="answerTitle">Model answer</div>
+                      <div className="answerText">{currentExamQ()!.modelAnswer}</div>
+                      {currentExamQ()!.sourceNote && <div className="answerMeta">Source: {currentExamQ()!.sourceNote}</div>}
+                    </div>
+                  )}
+
+                  <div className="hint">Be strict: only mark “right” if you could say it cleanly without prompting.</div>
+                </>
+              ) : (
+                <div className="hint">Preparing exam…</div>
+              )}
+            </>
+          )}
+
+          {mode === "examResult" && (
+            <>
+              <div className="kpiRow">
+                <div className="kpi">
+                  <div className="k">Score</div>
+                  <div className="v">{examScore.correct}/{examScore.total}</div>
+                </div>
+                <div className="kpi">
+                  <div className="k">Percentage</div>
+                  <div className="v">{examScore.pct}%</div>
+                </div>
+                <div className="kpi">
+                  <div className="k">Missed</div>
+                  <div className="v">{examScore.total - examScore.correct}</div>
                 </div>
               </div>
+
+              <div className="hr"></div>
+
+              {missedInExam.length ? (
+                <>
+                  <div className="label">Review the ones you missed</div>
+                  {missedInExam.map((q) => (
+                    <div key={q.id} style={{ marginBottom: 12 }}>
+                      <div className="qPrompt" style={{ fontSize: 15 }}>{q.prompt}</div>
+                      <div className="answerBox" style={{ marginTop: 6 }}>
+                        <div className="answerTitle">Model answer</div>
+                        <div className="answerText">{q.modelAnswer}</div>
+                      </div>
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <div className="label">Clean sheet. Nice.</div>
+              )}
             </>
           )}
         </section>
 
-        <section className="card right">
+        <section className="card">
           <div className="cardHeader">
             <div className="cardTitle">Study tools</div>
           </div>
@@ -423,33 +617,90 @@ export default function App() {
                 );
               })}
             </div>
-            <div className="hint">No tags selected = all questions.</div>
+            <div className="hint">No tags selected = all questions. Exam mode uses the same filter.</div>
+          </div>
+
+          <div className="block">
+            <div className="label">Weak areas</div>
+
+            <div className="hint">Based on your history. Needs a few attempts per area to be meaningful.</div>
+
+            <div className="hr"></div>
+
+            <div className="label" style={{ fontSize: 13 }}>Weakest tags</div>
+            {weakestTags.length ? (
+              <table className="smallTable">
+                <thead>
+                  <tr><th>Tag</th><th>Acc</th><th>Attempts</th></tr>
+                </thead>
+                <tbody>
+                  {weakestTags.map(r => (
+                    <tr key={r.tag}>
+                      <td>{r.tag}</td>
+                      <td>{r.acc}%</td>
+                      <td>{r.attempts}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="hint">Do a few rounds first; this list appears after ~3 attempts per tag.</div>
+            )}
+
+            <div className="hr"></div>
+
+            <div className="label" style={{ fontSize: 13 }}>Weakest questions</div>
+            {weakestQuestions.length ? (
+              <table className="smallTable">
+                <thead>
+                  <tr><th>Question</th><th>Acc</th><th>Attempts</th></tr>
+                </thead>
+                <tbody>
+                  {weakestQuestions.map(r => (
+                    <tr key={r.qid}>
+                      <td>{r.prompt}</td>
+                      <td>{r.acc}%</td>
+                      <td>{r.attempts}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="hint">This list appears after ~2 attempts per question.</div>
+            )}
           </div>
 
           <div className="block">
             <div className="label">Reminders & notifications</div>
             <div className="row">
-              <label className="switch">
+              <label className="badge" style={{ cursor: "pointer" }}>
                 <input
                   type="checkbox"
                   checked={settings.reminderEnabled}
                   onChange={async (e) => {
                     const enabled = e.target.checked;
                     if (enabled) {
-                      const ok = await requestNotifications();
+                      const ok = await (async () => {
+                        if (!("Notification" in window)) return false;
+                        const perm = await Notification.requestPermission();
+                        return perm === "granted";
+                      })();
                       if (!ok) return;
                     }
                     setSettings({ ...settings, reminderEnabled: enabled });
                   }}
                 />
-                <span>Enable reminders</span>
+                <span style={{ marginLeft: 8 }}>Enable reminders</span>
               </label>
 
               <button
                 className="btn"
                 onClick={async () => {
-                  const ok = await requestNotifications();
-                  if (ok) fireReminderNotification();
+                  if (!("Notification" in window)) return;
+                  const perm = await Notification.requestPermission();
+                  if (perm === "granted") {
+                    try { new Notification("ITF Theory Mock Test", { body: settings.reminderMessage }); } catch {}
+                  }
                 }}
               >
                 Test notification
@@ -461,6 +712,7 @@ export default function App() {
                 <span>Time</span>
                 <input type="time" value={settings.reminderTime} onChange={(e) => setSettings({ ...settings, reminderTime: e.target.value })} />
               </label>
+
               <label className="field">
                 <span>Daily goal</span>
                 <input
@@ -471,9 +723,20 @@ export default function App() {
                   onChange={(e) => setSettings({ ...settings, dailyGoal: clamp(parseInt(e.target.value || "10", 10), 1, 200) })}
                 />
               </label>
+
+              <label className="field">
+                <span>Exam length</span>
+                <input
+                  type="number"
+                  min={5}
+                  max={50}
+                  value={settings.testLength}
+                  onChange={(e) => setSettings({ ...settings, testLength: clamp(parseInt(e.target.value || "10", 10), 5, 50) })}
+                />
+              </label>
             </div>
 
-            <div className="label small">Days</div>
+            <div className="label" style={{ fontSize: 12, color: "var(--muted)", marginTop: 10 }}>Days</div>
             <div className="row wrapRow">
               {[1, 2, 3, 4, 5, 6, 0].map((d) => {
                 const active = settings.reminderDays.includes(d);
@@ -499,18 +762,14 @@ export default function App() {
               <input type="text" value={settings.reminderMessage} onChange={(e) => setSettings({ ...settings, reminderMessage: e.target.value })} />
             </label>
 
-            <div className="hint">Android notifications depend on browser/app state. Your ChatGPT reminder is the reliable backstop.</div>
+            <div className="hint">Android notifications can be throttled by battery optimisation; your ChatGPT reminder remains the reliable backstop.</div>
           </div>
 
           <div className="block">
             <div className="label">Question bank</div>
             <div className="row">
-              <button className="btn" onClick={openEditor}>
-                Edit / paste JSON
-              </button>
-              <button className="btn" onClick={exportBank}>
-                Export JSON
-              </button>
+              <button className="btn" onClick={openEditor}>Edit / paste JSON</button>
+              <button className="btn" onClick={exportBank}>Export JSON</button>
             </div>
           </div>
         </section>
@@ -521,26 +780,19 @@ export default function App() {
           <div className="modal">
             <div className="modalHeader">
               <div className="modalTitle">Edit question bank (JSON)</div>
-              <button className="btn" onClick={() => setEditorOpen(false)}>
-                Close
-              </button>
+              <button className="btn" onClick={() => setEditorOpen(false)}>Close</button>
             </div>
             <textarea className="editor" value={editorText} onChange={(e) => setEditorText(e.target.value)} spellCheck={false} />
             <div className="modalFooter">
-              <button className="btn" onClick={() => setEditorOpen(false)}>
-                Cancel
-              </button>
-              <button className="btn primary" onClick={saveEditor}>
-                Save bank
-              </button>
+              <button className="btn" onClick={() => setEditorOpen(false)}>Cancel</button>
+              <button className="btn primary" onClick={saveEditor}>Save bank</button>
             </div>
             <div className="hint">Each entry needs: id, prompt, modelAnswer. Optional: tags, sourceNote.</div>
           </div>
         </div>
       )}
 
-      <footer className="footer">Tip: Reveal model answer, then mark Correct/Incorrect honestly.</footer>
+      <footer className="footer">Dojo tip: in Exam Mode, only mark “right” if you could answer cleanly, first time.</footer>
     </div>
   );
 }
-
